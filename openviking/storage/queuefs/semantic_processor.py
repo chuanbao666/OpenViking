@@ -3,6 +3,7 @@
 """SemanticProcessor: Processes messages from SemanticQueue, generates .abstract.md and .overview.md."""
 
 import asyncio
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from openviking.parse.parsers.constants import (
@@ -24,6 +25,7 @@ from openviking.storage.queuefs.named_queue import DequeueHandlerBase
 from openviking.storage.queuefs.semantic_dag import DagStats, SemanticDagExecutor
 from openviking.storage.queuefs.semantic_msg import SemanticMsg
 from openviking.storage.viking_fs import get_viking_fs
+from openviking.utils.otel import get_meter
 from openviking_cli.session.user_id import UserIdentifier
 from openviking_cli.utils import VikingURI
 from openviking_cli.utils.config import get_openviking_config
@@ -54,6 +56,22 @@ class SemanticProcessor(DequeueHandlerBase):
         self._dag_executor: Optional[SemanticDagExecutor] = None
         self._current_ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.ROOT)
         self._current_msg: Optional[SemanticMsg] = None
+
+        # Initialize metrics
+        meter = get_meter()
+        self._downstream_total = meter.create_counter(
+            "downstream_api_requests_total",
+            description="Total number of downstream API calls",
+        )
+        self._downstream_duration = meter.create_histogram(
+            "downstream_api_duration_seconds",
+            unit="s",
+            description="Duration of downstream API calls",
+        )
+        self._downstream_errors = meter.create_counter(
+            "downstream_api_errors_total",
+            description="Total number of downstream API call errors",
+        )
 
     @staticmethod
     def _owner_space_for_uri(uri: str, ctx: RequestContext) -> str:
@@ -363,7 +381,21 @@ class SemanticProcessor(DequeueHandlerBase):
                             {"file_name": file_name, "skeleton": skeleton_text},
                         )
                         async with llm_sem:
-                            summary = await vlm.get_completion_async(prompt)
+                            start_time = time.time()
+                            self._downstream_total.add(
+                                1, {"api_type": "llm", "operation": "code_ast_summary"}
+                            )
+                            try:
+                                summary = await vlm.get_completion_async(prompt)
+                                self._downstream_duration.record(
+                                    time.time() - start_time,
+                                    {"api_type": "llm", "operation": "code_ast_summary"},
+                                )
+                            except Exception as e:
+                                self._downstream_errors.add(
+                                    1, {"api_type": "llm", "operation": "code_ast_summary"}
+                                )
+                                raise e
                         return {"name": file_name, "summary": summary.strip()}
                 if skeleton_text is None:
                     logger.info("AST unsupported language, fallback to LLM: %s", file_path)
@@ -376,7 +408,16 @@ class SemanticProcessor(DequeueHandlerBase):
                 {"file_name": file_name, "content": content},
             )
             async with llm_sem:
-                summary = await vlm.get_completion_async(prompt)
+                start_time = time.time()
+                self._downstream_total.add(1, {"api_type": "llm", "operation": "code_summary"})
+                try:
+                    summary = await vlm.get_completion_async(prompt)
+                    self._downstream_duration.record(
+                        time.time() - start_time, {"api_type": "llm", "operation": "code_summary"}
+                    )
+                except Exception as e:
+                    self._downstream_errors.add(1, {"api_type": "llm", "operation": "code_summary"})
+                    raise e
             return {"name": file_name, "summary": summary.strip()}
 
         elif file_type == FILE_TYPE_DOCUMENTATION:
@@ -390,7 +431,16 @@ class SemanticProcessor(DequeueHandlerBase):
         )
 
         async with llm_sem:
-            summary = await vlm.get_completion_async(prompt)
+            start_time = time.time()
+            self._downstream_total.add(1, {"api_type": "llm", "operation": "file_summary"})
+            try:
+                summary = await vlm.get_completion_async(prompt)
+                self._downstream_duration.record(
+                    time.time() - start_time, {"api_type": "llm", "operation": "file_summary"}
+                )
+            except Exception as e:
+                self._downstream_errors.add(1, {"api_type": "llm", "operation": "file_summary"})
+                raise e
         return {"name": file_name, "summary": summary.strip()}
 
     async def _generate_single_file_summary(
@@ -492,7 +542,19 @@ class SemanticProcessor(DequeueHandlerBase):
                 },
             )
 
-            overview = await vlm.get_completion_async(prompt)
+            start_time = time.time()
+            self._downstream_total.add(1, {"api_type": "llm", "operation": "overview_generation"})
+            try:
+                overview = await vlm.get_completion_async(prompt)
+                self._downstream_duration.record(
+                    time.time() - start_time,
+                    {"api_type": "llm", "operation": "overview_generation"},
+                )
+            except Exception as e:
+                self._downstream_errors.add(
+                    1, {"api_type": "llm", "operation": "overview_generation"}
+                )
+                raise e
 
             # Post-process: replace [number] with actual file name
             def replace_index(match):

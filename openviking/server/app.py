@@ -31,6 +31,7 @@ from openviking.server.routers import (
 )
 from openviking.service.core import OpenVikingService
 from openviking.service.task_tracker import get_task_tracker
+from openviking.utils.otel import init_otel
 from openviking_cli.exceptions import OpenVikingError
 from openviking_cli.utils import get_logger
 
@@ -54,6 +55,12 @@ def create_app(
         config = load_server_config()
 
     validate_server_config(config)
+
+    # Initialize OTEL metrics
+    init_otel(
+        service_name="openviking",
+        port=config.metrics_port if hasattr(config, "metrics_port") else 8000,
+    )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -103,6 +110,10 @@ def create_app(
         version="0.1.0",
         lifespan=lifespan,
     )
+
+    from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+
+    FastAPIInstrumentor.instrument_app(app)
 
     app.state.config = config
 

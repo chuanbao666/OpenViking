@@ -16,6 +16,7 @@ import asyncio
 import contextvars
 import hashlib
 import json
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -24,6 +25,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 from openviking.pyagfs.exceptions import AGFSHTTPError
 from openviking.server.identity import RequestContext, Role
+from openviking.utils.otel import get_meter
 from openviking.utils.time_utils import format_simplified, get_current_timestamp, parse_iso_datetime
 from openviking_cli.exceptions import NotFoundError
 from openviking_cli.session.user_id import UserIdentifier
@@ -174,6 +176,22 @@ class VikingFS:
             "vikingfs_bound_ctx", default=None
         )
 
+        # Initialize metrics
+        meter = get_meter()
+        self._fs_op_total = meter.create_counter(
+            "fs_op_total",
+            description="Total number of file system operations",
+        )
+        self._fs_op_duration = meter.create_histogram(
+            "fs_op_duration_seconds",
+            unit="s",
+            description="Duration of file system operations",
+        )
+        self._fs_op_errors = meter.create_counter(
+            "fs_op_errors_total",
+            description="Total number of file system operation errors",
+        )
+
     @staticmethod
     def _default_ctx() -> RequestContext:
         return RequestContext(user=UserIdentifier.the_default_user(), role=Role.ROOT)
@@ -208,15 +226,22 @@ class VikingFS:
         ctx: Optional[RequestContext] = None,
     ) -> bytes:
         """Read file"""
-        self._ensure_access(uri, ctx)
-        path = self._uri_to_path(uri, ctx=ctx)
-        result = self.agfs.read(path, offset, size)
-        if isinstance(result, bytes):
-            return result
-        elif result is not None and hasattr(result, "content"):
-            return result.content
-        else:
-            return b""
+        start_time = time.time()
+        self._fs_op_total.add(1, {"op": "read"})
+        try:
+            self._ensure_access(uri, ctx)
+            path = self._uri_to_path(uri, ctx=ctx)
+            result = self.agfs.read(path, offset, size)
+            self._fs_op_duration.record(time.time() - start_time, {"op": "read"})
+            if isinstance(result, bytes):
+                return result
+            elif result is not None and hasattr(result, "content"):
+                return result.content
+            else:
+                return b""
+        except Exception as e:
+            self._fs_op_errors.add(1, {"op": "read"})
+            raise e
 
     async def write(
         self,
@@ -225,11 +250,19 @@ class VikingFS:
         ctx: Optional[RequestContext] = None,
     ) -> str:
         """Write file"""
-        self._ensure_access(uri, ctx)
-        path = self._uri_to_path(uri, ctx=ctx)
-        if isinstance(data, str):
-            data = data.encode("utf-8")
-        return self.agfs.write(path, data)
+        start_time = time.time()
+        self._fs_op_total.add(1, {"op": "write"})
+        try:
+            self._ensure_access(uri, ctx)
+            path = self._uri_to_path(uri, ctx=ctx)
+            if isinstance(data, str):
+                data = data.encode("utf-8")
+            res = self.agfs.write(path, data)
+            self._fs_op_duration.record(time.time() - start_time, {"op": "write"})
+            return res
+        except Exception as e:
+            self._fs_op_errors.add(1, {"op": "write"})
+            raise e
 
     async def mkdir(
         self,
@@ -614,13 +647,20 @@ class VikingFS:
             target_directories=[target_uri] if target_uri else None,
         )
 
-        result = await retriever.retrieve(
-            typed_query,
-            ctx=self._ctx_or_default(ctx),
-            limit=limit,
-            score_threshold=score_threshold,
-            scope_dsl=filter,
-        )
+        start_time = time.time()
+        self._fs_op_total.add(1, {"op": "find"})
+        try:
+            result = await retriever.retrieve(
+                typed_query,
+                ctx=self._ctx_or_default(ctx),
+                limit=limit,
+                score_threshold=score_threshold,
+                scope_dsl=filter,
+            )
+            self._fs_op_duration.record(time.time() - start_time, {"op": "find"})
+        except Exception as e:
+            self._fs_op_errors.add(1, {"op": "find"})
+            raise e
 
         # Convert QueryResult to FindResult
         memories, resources, skills = [], [], []
@@ -749,7 +789,14 @@ class VikingFS:
                 scope_dsl=filter,
             )
 
-        query_results = await asyncio.gather(*[_execute(tq) for tq in typed_queries])
+        start_time = time.time()
+        self._fs_op_total.add(1, {"op": "search"})
+        try:
+            query_results = await asyncio.gather(*[_execute(tq) for tq in typed_queries])
+            self._fs_op_duration.record(time.time() - start_time, {"op": "search"})
+        except Exception as e:
+            self._fs_op_errors.add(1, {"op": "search"})
+            raise e
 
         # Aggregate results to FindResult
         memories, resources, skills = [], [], []
@@ -889,7 +936,15 @@ class VikingFS:
         At account root (/local/{account}), uses VALID_SCOPES whitelist.
         At other levels, uses _INTERNAL_DIRS blacklist.
         """
-        entries = self.agfs.ls(path)
+        start_time = time.time()
+        self._fs_op_total.add(1, {"op": "ls"})
+        try:
+            entries = self.agfs.ls(path)
+            self._fs_op_duration.record(time.time() - start_time, {"op": "ls"})
+        except Exception as e:
+            self._fs_op_errors.add(1, {"op": "ls"})
+            raise e
+
         parts = [p for p in path.strip("/").split("/") if p]
         if len(parts) == 2 and parts[0] == "local":
             return [e for e in entries if e.get("name") in VikingURI.VALID_SCOPES]

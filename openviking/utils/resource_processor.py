@@ -7,6 +7,7 @@ Handles coordinated writes and self-iteration processes
 as described in the OpenViking design document.
 """
 
+import time
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from openviking.parse.tree_builder import TreeBuilder
@@ -14,6 +15,7 @@ from openviking.server.identity import RequestContext
 from openviking.storage import VikingDBManager
 from openviking.storage.viking_fs import get_viking_fs
 from openviking.utils.embedding_utils import index_resource
+from openviking.utils.otel import get_meter
 from openviking.utils.summarizer import Summarizer
 from openviking_cli.utils import get_logger
 from openviking_cli.utils.storage import StoragePath
@@ -52,6 +54,23 @@ class ResourceProcessor:
         self._vlm_processor = None
         self._media_processor = None
         self._summarizer = None
+
+        # Initialize metrics
+        meter = get_meter()
+        self._process_total = meter.create_counter(
+            "resource_process_total",
+            description="Total number of resource processing requests",
+        )
+        self._process_duration = meter.create_histogram(
+            "resource_process_duration_seconds",
+            unit="s",
+            description="Duration of resource processing",
+        )
+        self._phase_duration = meter.create_histogram(
+            "resource_process_phase_seconds",
+            unit="s",
+            description="Duration of each phase in resource processing",
+        )
 
     def _get_summarizer(self) -> "Summarizer":
         """Lazy initialization of Summarizer."""
@@ -114,6 +133,9 @@ class ResourceProcessor:
         3. (Optional) Build vector index
         4. (Optional) Summarize
         """
+        start_time = time.time()
+        self._process_total.add(1, {"scope": scope})
+
         result = {
             "status": "success",
             "errors": [],
@@ -121,6 +143,7 @@ class ResourceProcessor:
         }
 
         # ============ Phase 1: Parse source (Parser generates L0/L1 and writes to temp) ============
+        phase_start = time.time()
         try:
             media_processor = self._get_media_processor()
             viking_fs = get_viking_fs()
@@ -144,10 +167,17 @@ class ResourceProcessor:
                 result["errors"].extend(
                     parse_result.warnings or ["Parse failed: no content generated"],
                 )
+                self._phase_duration.record(
+                    time.time() - phase_start, {"phase": "parse", "status": "error"}
+                )
                 return result
 
             if parse_result.warnings:
                 result["errors"].extend(parse_result.warnings)
+
+            self._phase_duration.record(
+                time.time() - phase_start, {"phase": "parse", "status": "success"}
+            )
 
         except Exception as e:
             result["status"] = "error"
@@ -156,6 +186,9 @@ class ResourceProcessor:
             import traceback
 
             traceback.print_exc()
+            self._phase_duration.record(
+                time.time() - phase_start, {"phase": "parse", "status": "error"}
+            )
             return result
 
         # parse_result contains:
@@ -165,6 +198,7 @@ class ResourceProcessor:
 
         # ============ Phase 2: Pass to and parent directly to TreeBuilder ============
         # ============ Phase 3: TreeBuilder finalizes from temp (scan + move to AGFS) ============
+        phase_start = time.time()
         try:
             with get_viking_fs().bind_request_context(ctx):
                 context_tree = await self.tree_builder.finalize_from_temp(
@@ -178,9 +212,15 @@ class ResourceProcessor:
                 )
                 if context_tree and context_tree.root:
                     result["root_uri"] = context_tree.root.uri
+            self._phase_duration.record(
+                time.time() - phase_start, {"phase": "finalize", "status": "success"}
+            )
         except Exception as e:
             result["status"] = "error"
             result["errors"].append(f"Finalize from temp error: {e}")
+            self._phase_duration.record(
+                time.time() - phase_start, {"phase": "finalize", "status": "error"}
+            )
 
             # Cleanup temporary directory on error (via VikingFS)
             try:
@@ -194,30 +234,45 @@ class ResourceProcessor:
         # ============ Phase 4: Optional Steps ============
         build_index = kwargs.get("build_index", True)
         if summarize:
+            phase_start = time.time()
             # Explicit summarization request.
             # If build_index is ALSO True, we want vectorization.
             # If build_index is False, we skip vectorization.
             skip_vec = not build_index
             try:
-                await self._get_summarizer().summarize(
+                summarize_result = await self.summarize(
                     resource_uris=[result["root_uri"]],
                     ctx=ctx,
                     skip_vectorization=skip_vec,
                     **kwargs,
                 )
+                result["summarize"] = summarize_result
+                self._phase_duration.record(
+                    time.time() - phase_start, {"phase": "summarize", "status": "success"}
+                )
             except Exception as e:
-                logger.error(f"Summarization failed: {e}")
-                result["warnings"] = result.get("warnings", []) + [f"Summarization failed: {e}"]
+                logger.error(f"Summarize failed: {e}")
+                result["warnings"] = result.get("warnings", []) + [f"Summarize failed: {e}"]
+                self._phase_duration.record(
+                    time.time() - phase_start, {"phase": "summarize", "status": "error"}
+                )
 
         elif build_index:
-            # Standard compatibility mode: "Just Index it" usually implies ingestion flow.
-            # We assume this means "Ingest and Index", which requires summarization.
+            phase_start = time.time()
+            # No explicit summary, but auto-index is requested.
             try:
-                await self._get_summarizer().summarize(
+                await self.build_index(
                     resource_uris=[result["root_uri"]], ctx=ctx, skip_vectorization=False, **kwargs
+                )
+                self._phase_duration.record(
+                    time.time() - phase_start, {"phase": "index", "status": "success"}
                 )
             except Exception as e:
                 logger.error(f"Auto-index failed: {e}")
                 result["warnings"] = result.get("warnings", []) + [f"Auto-index failed: {e}"]
+                self._phase_duration.record(
+                    time.time() - phase_start, {"phase": "index", "status": "error"}
+                )
 
+        self._process_duration.record(time.time() - start_time, {"status": result["status"]})
         return result

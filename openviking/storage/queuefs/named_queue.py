@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union
 
+from openviking.utils.otel import get_meter
 from openviking_cli.utils.logger import get_logger
 
 if TYPE_CHECKING:
@@ -116,6 +117,21 @@ class NamedQueue:
         self._error_count = 0
         self._errors: List[QueueError] = []
 
+        # Initialize metrics
+        meter = get_meter()
+        self._backlog_count = meter.create_up_down_counter(
+            "queue_backlog_count",
+            description="Number of pending messages in the queue",
+        )
+        self._processing_count = meter.create_up_down_counter(
+            "queue_processing_count",
+            description="Number of messages currently being processed",
+        )
+        self._processed_total = meter.create_counter(
+            "queue_processed_total",
+            description="Total number of messages processed",
+        )
+
         # Inject callbacks to handler
         if self._dequeue_handler:
             self._dequeue_handler.set_callbacks(
@@ -127,12 +143,16 @@ class NamedQueue:
         """Called on dequeue."""
         with self._lock:
             self._in_progress += 1
+            self._processing_count.add(1, {"queue_name": self.name})
+            self._backlog_count.add(-1, {"queue_name": self.name})
 
     def _on_process_success(self) -> None:
         """Called on processing success."""
         with self._lock:
             self._in_progress -= 1
             self._processed += 1
+            self._processing_count.add(-1, {"queue_name": self.name})
+            self._processed_total.add(1, {"queue_name": self.name, "status": "success"})
 
     def _on_process_error(self, error_msg: str, data: Optional[Dict[str, Any]] = None) -> None:
         """Called on processing failure."""
@@ -148,6 +168,8 @@ class NamedQueue:
             )
             if len(self._errors) > self.MAX_ERRORS:
                 self._errors = self._errors[-self.MAX_ERRORS :]
+            self._processing_count.add(-1, {"queue_name": self.name})
+            self._processed_total.add(1, {"queue_name": self.name, "status": "error"})
 
     async def get_status(self) -> QueueStatus:
         """Get queue status."""
@@ -196,6 +218,7 @@ class NamedQueue:
             data = json.dumps(data)
 
         msg_id = self._agfs.write(enqueue_file, data.encode("utf-8"))
+        self._backlog_count.add(1, {"queue_name": self.name})
         return msg_id if isinstance(msg_id, str) else str(msg_id)
 
     def _read_queue_message(self) -> Optional[Dict[str, Any]]:

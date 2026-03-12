@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import time
 import uuid
 from typing import Any, Dict, List, Optional
 
@@ -12,6 +13,7 @@ from openviking.storage.expr import And, Eq, FilterExpr, In, Or, PathScope, RawD
 from openviking.storage.vectordb.collection.collection import Collection
 from openviking.storage.vectordb.utils.logging_init import init_cpp_logging
 from openviking.storage.vectordb_adapters import CollectionAdapter, create_collection_adapter
+from openviking.utils.otel import get_meter
 from openviking_cli.utils import get_logger
 from openviking_cli.utils.config.vectordb_config import VectorDBBackendConfig
 
@@ -46,6 +48,22 @@ class VikingVectorIndexBackend:
 
         self._collection_config: Dict[str, Any] = {}
         self._meta_data_cache: Dict[str, Any] = {}
+
+        # Initialize metrics
+        meter = get_meter()
+        self._vector_op_total = meter.create_counter(
+            "vector_op_total",
+            description="Total number of vector database operations",
+        )
+        self._vector_op_duration = meter.create_histogram(
+            "vector_op_duration_seconds",
+            unit="s",
+            description="Duration of vector database operations",
+        )
+        self._vector_op_errors = meter.create_counter(
+            "vector_op_errors_total",
+            description="Total number of vector database operation errors",
+        )
 
     @property
     def collection_name(self) -> str:
@@ -155,22 +173,39 @@ class VikingVectorIndexBackend:
         if not payload.get("id"):
             payload["id"] = str(uuid.uuid4())
 
-        payload = self._filter_known_fields(payload)
-        ids = self._adapter.upsert(payload)
-        return ids[0] if ids else ""
+        start_time = time.time()
+        self._vector_op_total.add(1, {"op": "upsert"})
+        try:
+            payload = self._filter_known_fields(payload)
+            ids = self._adapter.upsert(payload)
+            self._vector_op_duration.record(time.time() - start_time, {"op": "upsert"})
+            return ids[0] if ids else ""
+        except Exception as e:
+            self._vector_op_errors.add(1, {"op": "upsert"})
+            raise e
 
     async def get(self, ids: List[str]) -> List[Dict[str, Any]]:
+        start_time = time.time()
+        self._vector_op_total.add(1, {"op": "get"})
         try:
-            return self._adapter.get(ids)
+            res = self._adapter.get(ids)
+            self._vector_op_duration.record(time.time() - start_time, {"op": "get"})
+            return res
         except Exception as e:
             logger.error("Error getting records: %s", e)
+            self._vector_op_errors.add(1, {"op": "get"})
             return []
 
     async def delete(self, ids: List[str]) -> int:
+        start_time = time.time()
+        self._vector_op_total.add(1, {"op": "delete"})
         try:
-            return self._adapter.delete(ids=ids)
+            res = self._adapter.delete(ids=ids)
+            self._vector_op_duration.record(time.time() - start_time, {"op": "delete"})
+            return res
         except Exception as e:
             logger.error("Error deleting records: %s", e)
+            self._vector_op_errors.add(1, {"op": "delete"})
             return 0
 
     async def exists(self, id: str) -> bool:
@@ -203,8 +238,10 @@ class VikingVectorIndexBackend:
         order_by: Optional[str] = None,
         order_desc: bool = False,
     ) -> List[Dict[str, Any]]:
+        start_time = time.time()
+        self._vector_op_total.add(1, {"op": "query"})
         try:
-            return self._adapter.query(
+            res = self._adapter.query(
                 query_vector=query_vector,
                 sparse_query_vector=sparse_query_vector,
                 filter=filter,
@@ -214,8 +251,11 @@ class VikingVectorIndexBackend:
                 order_by=order_by,
                 order_desc=order_desc,
             )
+            self._vector_op_duration.record(time.time() - start_time, {"op": "query"})
+            return res
         except Exception as e:
             logger.error("Error querying collection %s: %s", self._collection_name, e)
+            self._vector_op_errors.add(1, {"op": "query"})
             return []
 
     async def search(

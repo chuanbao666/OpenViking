@@ -10,6 +10,7 @@ similar to how init_viking_fs encapsulates VikingFS initialization.
 import asyncio
 import hashlib
 import json
+import time
 from typing import Any, Dict, Optional
 
 from openviking.models.embedder.base import EmbedResult
@@ -17,6 +18,7 @@ from openviking.storage.errors import CollectionNotFoundError
 from openviking.storage.queuefs.embedding_msg import EmbeddingMsg
 from openviking.storage.queuefs.named_queue import DequeueHandlerBase
 from openviking.storage.viking_vector_index_backend import VikingVectorIndexBackend
+from openviking.utils.otel import get_meter
 from openviking_cli.utils import get_logger
 from openviking_cli.utils.config.open_viking_config import OpenVikingConfig
 
@@ -142,6 +144,22 @@ class TextEmbeddingHandler(DequeueHandlerBase):
         self._vector_dim = config.embedding.dimension
         self._initialize_embedder(config)
 
+        # Initialize metrics
+        meter = get_meter()
+        self._downstream_total = meter.create_counter(
+            "downstream_api_requests_total",
+            description="Total number of downstream API calls",
+        )
+        self._downstream_duration = meter.create_histogram(
+            "downstream_api_duration_seconds",
+            unit="s",
+            description="Duration of downstream API calls",
+        )
+        self._downstream_errors = meter.create_counter(
+            "downstream_api_errors_total",
+            description="Total number of downstream API call errors",
+        )
+
     def _initialize_embedder(self, config: "OpenVikingConfig"):
         """Initialize the embedder instance from config."""
         self._embedder = config.embedding.get_embedder()
@@ -193,9 +211,18 @@ class TextEmbeddingHandler(DequeueHandlerBase):
             if self._embedder:
                 # embed() is a blocking HTTP call; offload to thread pool to avoid
                 # blocking the event loop and allow real concurrency.
-                result: EmbedResult = await asyncio.to_thread(
-                    self._embedder.embed, embedding_msg.message
-                )
+                start_time = time.time()
+                self._downstream_total.add(1, {"api_type": "embedding"})
+                try:
+                    result: EmbedResult = await asyncio.to_thread(
+                        self._embedder.embed, embedding_msg.message
+                    )
+                    self._downstream_duration.record(
+                        time.time() - start_time, {"api_type": "embedding"}
+                    )
+                except Exception as e:
+                    self._downstream_errors.add(1, {"api_type": "embedding"})
+                    raise e
 
                 # Add dense vector
                 if result.dense_vector:
